@@ -1,0 +1,467 @@
+---
+title: "integrated_tumor_only_processing"
+author: "Sonam Bhatia"
+date: "5/26/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+opts_knit$set(root.dir = "/Users/sonambhatia/Documents_local/tnbc_manuscript_r_scripts/integrated_tumor_only_processing")
+```
+
+## Summary and pre-processing
+
+Experiment was done in three batches:
+Batch1 samples: NM05N, NM04N1, NH64T
+Batch2 samples: NH87ND, NH87T, HCM-CSHL-0655-C50
+Batch3 samples: multiplexed 4 samples with the following barcodes
+  GACAGTGC HCM-CSHL-0366-C50
+  GAGTTAGC NH85TSc
+  GATGAATC NH95T
+  GCCAAGAC NH93T
+
+10x Single cell RNA-seq analysis
+-- pre-processing using cell ranger
+-- aligned to grch38
+
+load packages
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(magrittr)
+library(future.apply)
+library(cowplot)
+library(hdf5r)
+library(stringr)
+library(ggplot2)
+getwd()
+```
+
+### process data files
+
+```{r results='hide', message=FALSE, warning=TRUE}
+
+NH64T= Read10X_h5("/Users/sonambhatia/Documents_local/tnbc_manuscript_r_scripts/data/Bhatia_03-NH64T_filtered_feature_bc_matrix.h5",use.names=TRUE, unique.features = TRUE)
+
+## read SB04 remapped to grch38
+
+NH87T= Read10X_h5("/Users/sonambhatia/Documents_local/tnbc_manuscript_r_scripts/data/Bhatia_04_10xGEX_NH87TT_filtered_feature_bc_matrix.h5")
+`HCM-CSHL-0655-C50`= Read10X_h5("/Users/sonambhatia/Documents_local/tnbc_manuscript_r_scripts/data/Bhatia_04_10xGEX_HC_0655_filtered_feature_bc_matrix.h5")
+
+## read SB06 mapped to grch38
+
+sb06_data= Read10X_h5("/Users/sonambhatia/Documents_local/tnbc_manuscript_r_scripts/data/Bhatia_06_superloaded10xGEX_filtered_feature_bc_matrix.h5",use.names=TRUE, unique.features = TRUE)
+
+## make Seurat objects
+sb06_obj= CreateSeuratObject(sb06_data, min.cells = 3, min.features = 200, project = "sb06_4x")
+
+# barcodes from Vireo
+
+library(readr)
+barcode_key <- read_csv("~/Documents/HumanOrganoid/Bioinformatics/scRNA-seq/Data_from_JPreall/SB06/demultiplex_vireo/barcode_key.csv", 
+                        col_names = FALSE)
+
+donor_ids <- read_delim("~/Documents/HumanOrganoid/Bioinformatics/scRNA-seq/Data_from_JPreall/SB06/demultiplex_vireo/vireo/donor_ids.tsv", 
+                        "\t", escape_double = FALSE, trim_ws = TRUE)
+
+#GACAGTGC HCM-CSHL-0366-C50
+
+#GAGTTAGC NH85TSc
+
+#GATGAATC NH95T
+
+#GCCAAGAC NH93T
+
+donor_ids$organoid_id= donor_ids$donor_id
+
+`HCM-CSHL-0366-C50_cells` = grep("GACAGTGC",donor_ids$organoid_id)
+donor_ids$organoid_id[`HCM-CSHL-0366-C50_cells`]="HCM-CSHL-0366-C50"
+
+NH85TSc_cells = grep("GAGTTAGC",donor_ids$organoid_id)
+donor_ids$organoid_id[NH85TSc_cells]="NH85TSc"
+
+NH95TT_cells = grep("GATGAATC",donor_ids$organoid_id)
+donor_ids$organoid_id[NH95TT_cells]="NH95T"
+
+NH93T_cells = grep("GCCAAGAC",donor_ids$organoid_id)
+donor_ids$organoid_id[NH93T_cells]="NH93T"
+
+summary(as.factor(donor_ids$organoid_id))
+
+## add barcode labels to metadata
+tail(donor_ids)
+tail(rownames(sb06_obj@meta.data))
+
+myBarcode = rownames(sb06_obj@meta.data) #get barcode from seurat
+test = donor_ids[match(myBarcode, donor_ids$cell), ] #match the order of seurat barcode with you data
+sb06_obj$vireo_id = test$organoid_id #put cell type into metadata
+
+sb06_obj$vireo_id
+
+```
+
+### make seurat objects for the individual TNBC tumor samples
+
+```{r results='hide', message=TRUE, warning=FALSE}
+## make Seurat objects
+nh64t_obj= CreateSeuratObject(NH64T, min.cells = 3, min.features = 200, project = "NH64T")
+nh87tt_obj= CreateSeuratObject(NH87T, min.cells = 3, min.features = 200, project = "NH87T")
+hc_0655_obj= CreateSeuratObject(`HCM-CSHL-0655-C50`, min.cells = 3, min.features = 200, project = "HCM-CSHL-0655-C50")
+
+# Check the metadata in the new Seurat objects
+head(hc_0655_obj@meta.data)
+head(sb06_obj@meta.data)
+
+sb06_obj@meta.data$test= sb06_obj@meta.data$vireo_id
+# set the orig.ident of sb06 as the patient id
+
+sb06_obj@meta.data$orig.ident= sb06_obj@meta.data$vireo_id
+head(sb06_obj@meta.data)
+
+##
+my.list= Filter(function(x) is(x, "Seurat"), mget(ls()))
+names(my.list)
+
+# add tumor vs normal in the metadata as a stimulus for the samples
+
+my.list$nh64t_obj$stim ="tumor"
+my.list$hc_0655_obj$stim ="tumor"
+my.list$nh87tt_obj$stim ="tumor"
+my.list$sb06_obj$stim ="tumor"
+
+```
+
+*merge seurat objects
+sources: https://github.com/hbctraining/scRNA-seq/blob/master/lessons/03_SC_quality_control-setup.md 
+https://satijalab.org/seurat/v3.0/merge_vignette.html
+
+
+```{r results='hide', message=TRUE, warning=TRUE}
+merged_seurat <- merge(nh64t_obj, y = c(hc_0655_obj,nh87tt_obj,sb06_obj), 
+                       add.cell.ids = c("nh64t_obj","hc_0655_obj","nh87tt_obj","sb06_obj"), project = "merged_all", 
+                       merge.data = TRUE)
+
+# Check that the merged object has the appropriate sample-specific prefixes
+head(merged_seurat@meta.data)
+tail(merged_seurat@meta.data)
+
+# Explore merged metadata
+# View(merged_seurat@meta.data)
+
+# Add number of genes per UMI for each cell to metadata
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+# Compute percent mito ratio
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+View(merged_seurat@meta.data)
+
+# Create metadata dataframe
+metadata <- merged_seurat@meta.data
+
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(seq_folder = orig.ident,
+                nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$seq_folder, "HCM-CSHL-0655-C50"))] <- "tumor"
+metadata$sample[which(str_detect(metadata$seq_folder, "NH87T"))] <- "tumor"
+metadata$sample[which(str_detect(metadata$seq_folder, "NH64T"))] <- "tumor"
+metadata$sample[which(str_detect(metadata$seq_folder, "NH93T"))] <- "tumor"
+metadata$sample[which(str_detect(metadata$seq_folder, "NH95T"))] <- "tumor"
+metadata$sample[which(str_detect(metadata$seq_folder, "NH85TSc"))] <- "tumor"
+metadata$sample[which(str_detect(metadata$seq_folder, "HCM-CSHL-0366-C50"))] <- "tumor"
+
+
+# Add metadata back to Seurat object
+merged_seurat@meta.data <- metadata
+
+# Create .RData object to load at any time
+save(merged_seurat, file="merged_seurat_tumor.RData")
+
+```
+
+### Visualize the number of cell counts per sample
+
+```{r results='hide', message=TRUE, warning=TRUE}
+
+
+#pdf("tumor_total_cell_numbers.#pdf")
+metadata %>% 
+  ggplot(aes(x=sample, fill=sample)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells")
+#dev.off()
+
+#pdf("tumor_total_cell_numbers_sample_type.#pdf")
+metadata %>% 
+  ggplot(aes(x=seq_folder, fill=seq_folder)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells")
+#dev.off()
+
+
+# Visualize the number UMIs/transcripts per cell
+#pdf("tumor_total_cell_numbers_UMI_per_cell.#pdf")
+metadata %>% 
+  ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+#dev.off()
+
+
+#pdf("tumor_total_cell_numbers_UMI_per_cell_type.#pdf")
+metadata %>% 
+  ggplot(aes(color=seq_folder, x=nUMI, fill= seq_folder)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+#dev.off()
+
+
+
+# Visualize the distribution of genes detected per cell via histogram
+#pdf("tumor_total_cell_numbers_genes_per_cell.#pdf")
+metadata %>% 
+  ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  theme_classic() +
+  scale_x_log10() + 
+  geom_vline(xintercept = 300)
+#dev.off()
+
+
+
+# Visualize the distribution of genes detected per cell via boxplot
+#pdf("tumor_total_cell_numbers_genes_per_cell_type.#pdf")
+metadata %>% 
+  ggplot(aes(x=seq_folder, y=log10(nGene), fill=seq_folder)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells vs NGenes")
+#dev.off()
+
+
+
+# Visualize the correlation between genes detected and number of UMIs 
+# Are there cells present with low numbers of genes/UMIs?
+#pdf("tumor_correlation_genes_vs_num_of_UMIs.#pdf")
+metadata %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+#dev.off()
+
+
+#pdf("tumor_correlation_genes_vs_num_of_UMIs_celltype.#pdf")
+metadata %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~seq_folder)
+#dev.off()
+
+
+# Visualize the distribution of mitochondrial gene expression detected per cell
+#pdf("tumor_correlation_MTgenes_vs_cell.#pdf")
+metadata %>% 
+  ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+#dev.off()
+
+#pdf("tumor_correlation_MTgenes_vs_cell_celltype.#pdf")
+metadata %>% 
+  ggplot(aes(color=seq_folder, x=mitoRatio, fill=seq_folder)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+#dev.off()
+
+
+
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+#pdf("tumor_complexity_genes_per_UMI.#pdf")
+metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+#dev.off()
+
+#pdf("tumor_complexity_genes_per_UMI_celltype.#pdf")
+metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, color = seq_folder, fill=seq_folder)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+#dev.off()
+
+```
+
+### Filter out low quality reads using selected thresholds
+
+use the merged and filtered object for all downstream analysis
+
+```{r results='hide', message=TRUE, warning=TRUE}
+filtered_seurat <- subset(x = merged_seurat, 
+                          subset= (nUMI >= 500) & 
+                            (nGene >= 250) & 
+                            (log10GenesPerUMI > 0.80) & 
+                            (mitoRatio < 0.20))
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+# Extract counts
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+nonzero <- counts > 0
+
+# Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+
+# Only keeping those genes expressed in more than 10 cells
+filtered_counts <- counts[keep_genes, ]
+
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+
+# Save filtered subset to new metadata
+metadata_clean <- filtered_seurat@meta.data
+
+### Plot after filtering
+
+#pdf("tumor_complexity_genes_per_UMI_FILTERED.#pdf")
+metadata_clean %>%
+  ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+#dev.off()
+
+
+#pdf("tumor_correlation_MTgenes_vs_cell_FILTERED.#pdf")
+metadata_clean %>% 
+  ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+#dev.off()
+
+#pdf("tumor_correlation_genes_vs_num_of_UMIs_FILTERED.#pdf")
+metadata_clean %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+#dev.off()
+
+#pdf("tumor_correlation_genes_vs_num_of_UMIs_celltype_FILTERED.#pdf")
+metadata_clean %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~seq_folder)
+#dev.off()
+
+
+#pdf("tumor_total_cell_numbers_genes_per_cell_FILTERED.#pdf")
+metadata_clean %>% 
+  ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  theme_classic() +
+  scale_x_log10() + 
+  geom_vline(xintercept = 300)
+#dev.off()
+
+#pdf("tumor_correlation_genes_vs_num_of_UMIs_celltype_FILTERED.#pdf")
+metadata_clean %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~seq_folder)
+#dev.off()
+
+
+#pdf("tumor_total_cell_numbers_genes_per_cell_type_FILTERED.#pdf")
+metadata_clean %>% 
+  ggplot(aes(x=seq_folder, y=log10(nGene), fill=seq_folder)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells vs NGenes")
+#dev.off()
+
+
+# Create .RData object to load at any time
+save(filtered_seurat, file="seurat_filtered_tumor.RData")
+
+saveRDS(filtered_seurat, file="seurat_filtered_tumor.rds")
+```
+
+Session info
+
+```{r session info, message=FALSE, warning=FALSE}
+sessionInfo()
+
+```
