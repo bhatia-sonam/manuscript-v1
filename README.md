@@ -1,7 +1,29 @@
 # manuscript-v1
 
+## Overview of the single cell RNA-seq analysis
 
-### R session information pertain to this analysis
+Experiment was done in three batches:
+Batch1 samples: NM05N, NM04N1, NH64T
+Batch2 samples: NH87ND, NH87T, HCM-CSHL-0655-C50
+Batch3 samples: multiplexed 4 samples with the following barcodes
+  GACAGTGC HCM-CSHL-0366-C50
+  GAGTTAGC NH85TSc
+  GATGAATC NH95T
+  GCCAAGAC NH93T
+
+10x Single cell RNA-seq analysis
+-- pre-processing using cell ranger
+-- aligned to grch38
+
+### For Figure 8
+Following are the detail for each code: 
+integrated_tumor_only_processing.Rmd: processing of individual TNBC tumor h5 files for integration. Removed low quality cells and genes
+
+integrated_tumor_only_SCT_integration.Rmd: SC transformation followed by anchor dependent integration for the TNBC tumors
+
+
+
+### R session information pertaining to this analysis
 
 R version 3.6.3 (2020-02-29)
 Platform: x86_64-apple-darwin15.6.0 (64-bit)
