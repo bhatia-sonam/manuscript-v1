@@ -15,6 +15,13 @@ Batch3 samples: multiplexed 4 samples with the following barcodes
 -- pre-processing using cell ranger
 -- aligned to grch38
 
+sources and tutorials used for analysis:
+https://github.com/hbctraining/scRNA-seq/blob/master/lessons/03_SC_quality_control-setup.md 
+https://satijalab.org/seurat/v3.0/merge_vignette.html
+https://hbctraining.github.io/scRNA-seq/lessons/06_SC_SCT_and_integration.html + seurat vignette
+  cluster specific marker expression from Seurat's vignette.
+ 
+  
 ### For Figure 8
 Following are the detail for each code: 
 integrated_tumor_only_processing.Rmd: processing of individual TNBC tumor h5 files for integration. Removed low quality cells and genes
