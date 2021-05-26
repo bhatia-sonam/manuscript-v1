@@ -1,0 +1,596 @@
+---
+title: "integrated_tumor_only_SCT_integration"
+author: "Sonam Bhatia"
+date: "5/26/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+opts_knit$set(root.dir = "/Users/sonambhatia/Documents_local/tnbc_manuscript_r_scripts/integrated_tumor_only_SCT")
+```
+
+## Read filtered object
+
+Experiment was done in three batches:
+Batch1 samples: NM05N, NM04N1, NH64T
+Batch2 samples: NH87ND, NH87T, HCM-CSHL-0655-C50
+Batch3 samples: multiplexed 4 samples with the following barcodes
+  GACAGTGC HCM-CSHL-0366-C50
+  GAGTTAGC NH85TSc
+  GATGAATC NH95T
+  GCCAAGAC NH93T
+
+10x Single cell RNA-seq analysis
+-- pre-processing using cell ranger
+-- aligned to grch38
+
+Seurat objects for each samples were merged and filtered for low quality genes and cells
+
+load packages and read the filtered object generated in integrated_tumor_only_processing.html
+
+sources: https://hbctraining.github.io/scRNA-seq/lessons/06_SC_SCT_and_integration.html + seurat vignette
+  cluster specific marker expression from Seurat's vignette
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(Seurat)
+library(tidyverse)
+library(RCurl)
+library(cowplot)
+library(metap)
+library(sctransform)
+library(dittoSeq)
+library(reshape2)
+library(plotly)
+library(ggplot2)
+library(ggrastr)
+
+filtered_seurat= readRDS("/Users/sonambhatia/Documents_local/tnbc_manuscript_r_scripts/integrated_tumor_only_processing/seurat_filtered_tumor.rds")
+```
+
+### Check cell cycle before sctransform 
+```{r results='hide', message=FALSE, warning=TRUE}
+
+# Normalize the counts
+seurat_phase <- NormalizeData(filtered_seurat)
+
+# Load cell cycle markers
+load("/Users/sonambhatia/Documents_local/tnbc_manuscript_r_scripts/cell_cycle.rda")
+
+# Score cells for cell cycle
+seurat_phase <- CellCycleScoring(seurat_phase, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+
+# View cell cycle scores and phases assigned to cells                                 
+View(seurat_phase@meta.data)       
+
+# To perform PCA, ID the most variable features and scale the data. 
+
+# Identify the most variable genes
+seurat_phase <- FindVariableFeatures(seurat_phase, 
+                                     selection.method = "vst",
+                                     nfeatures = 2000, 
+                                     verbose = FALSE)
+
+# Scale the counts
+seurat_phase <- ScaleData(seurat_phase)
+
+
+# Perform PCA
+seurat_phase <- RunPCA(seurat_phase)
+
+# Plot the PCA colored by cell cycle phase
+#pdf("./tumor/seurat_fitlered_analysis_PCA_cell_cycle.#pdf", height=4)
+DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+#dev.off()
+
+
+```
+
+
+### SCT transformation
+
+continue without regressing cell cycle differences but filter out the NA's and doublets in the data
+
+```{r results='hide', message=TRUE, warning=TRUE}
+
+
+metadata= filtered_seurat@meta.data
+filtered_seurat@meta.data$sample= as.factor(filtered_seurat@meta.data$sample)
+class(filtered_seurat@meta.data$sample)
+summary(filtered_seurat@meta.data$sample)
+class(filtered_seurat@meta.data$orig.ident)
+summary(as.factor(filtered_seurat@meta.data$seq_folder))
+
+filtered_seurat@meta.data$seq_folder= as.factor(filtered_seurat@meta.data$seq_folder)
+summary(filtered_seurat@meta.data$seq_folder)
+
+# remove NAs from metadata
+filtered_seurat_subset= subset(x = filtered_seurat, 
+       subset = seq_folder != "doublet")
+
+filtered_seurat_subset= subset(x = filtered_seurat_subset, 
+                               subset = seq_folder != "unassigned") ## remove NAs
+summary(filtered_seurat_subset@meta.data$seq_folder)
+
+summary(filtered_seurat_subset@meta.data$seq_folder)
+
+View(filtered_seurat_subset@meta.data)
+summary(filtered_seurat_subset@meta.data$seq_folder)
+summary(filtered_seurat_subset@meta.data$seq_folder)
+# Split seurat object by condition to perform cell cycle scoring and SCT on all samples
+split_seurat <- SplitObject(filtered_seurat_subset, split.by = "seq_folder")
+
+split_seurat <- split_seurat[c("HCM-CSHL-0655-C50", "HCM-CSHL-0366-C50","NH64T","NH85TSc","NH87T","NH93T","NH95T")]
+
+for (i in 1:length(split_seurat)) {
+  split_seurat[[i]] <- NormalizeData(split_seurat[[i]], verbose = TRUE)
+}
+
+for (i in 1:length(split_seurat)){
+  split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], g2m.features=g2m_genes, s.features=s_genes)
+}
+
+for (i in 1:length(split_seurat)){
+  split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("mitoRatio"))
+}
+
+
+
+
+# Check which assays are stored in objects
+split_seurat$NH64T@assays
+
+#split_seurat$normal@assays
+
+
+# Save intermediate filtered_seurat seurat object
+#saveRDS(split_seurat, "split_seurat.rds")
+
+
+```
+
+
+### integrate
+
+``` {r results='hide', message=TRUE, warning=TRUE}
+
+# Select the most variable features to use for integration
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat, 
+                                            nfeatures = 3000)
+
+# Prepare the SCT list object for integration
+split_seurat <- PrepSCTIntegration(object.list = split_seurat, 
+                                   anchor.features = integ_features)
+
+# Find integration anchors - takes a while to run
+integ_anchors <- FindIntegrationAnchors(object.list = split_seurat, 
+                                        normalization.method = "SCT", 
+                                        anchor.features = integ_features)
+
+# Integrate across conditions
+seurat_integrated <- IntegrateData(anchorset = integ_anchors, 
+                                   normalization.method = "SCT")
+
+
+# Save integrated seurat object
+#saveRDS(seurat_integrated, "integrated_seurat_tumor.rds")
+
+```
+
+
+### Run PCA and UMAP
+
+
+```{r results='hide', message=TRUE, warning=TRUE}
+# Run PCA
+seurat_integrated <- RunPCA(object = seurat_integrated)
+
+# Plot PCA
+
+#pdf("tumor_pca_integrated_seurat_group.#pdf")
+PCAPlot(seurat_integrated,
+        group.by = "seq_folder") 
+#dev.off()
+
+
+# Run UMAP
+seurat_integrated <- RunUMAP(seurat_integrated, 
+                             dims = 1:40,
+                             reduction = "pca")
+
+# Plot UMAP          
+#pdf("tumor_dimplot_integrated_seurat.#pdf")
+DimPlot(seurat_integrated, group.by = "seq_folder")
+#dev.off()
+
+
+#pdf("tumor_dimplot_integrated_seurat_split.#pdf", height=5)
+DimPlot(seurat_integrated,
+        split.by = "seq_folder")
+#dev.off()
+
+#pdf("tumor_dimplot_integrated_seurat_split_Phase.#pdf", height=5)
+DimPlot(seurat_integrated,
+        split.by = "Phase", group.by = "seq_folder")
+#dev.off()
+
+ElbowPlot(seurat_integrated) #10PCs
+
+#pdf("tumor_DimHeatmap_integrated_seurat_split.#pdf")
+DimHeatmap(seurat_integrated, 
+           dims = 1:10, 
+           cells = 500, 
+           balanced = TRUE)
+#dev.off()
+
+
+# Printing out the most variable genes driving PCs
+print(x = seurat_integrated[["pca"]], 
+      dims = 1:10, 
+      nfeatures = 5)
+
+
+# Plot the elbow plot
+ElbowPlot(object = seurat_integrated, 
+          ndims = 40) #plateaus around 15
+
+
+# Determine the K-nearest neighbor graph
+seurat_integrated <- FindNeighbors(object = seurat_integrated, 
+                                   dims = 1:15)
+
+# Determine the clusters for various resolutions                                
+seurat_integrated <- FindClusters(object = seurat_integrated,
+                                  resolution = c(0.2,0.4, 0.6, 0.8, 1.0, 1.4))
+
+# Explore resolutions
+seurat_integrated@meta.data %>% 
+  View()
+
+# check each resolution
+# use res 0.6 for all downstream
+
+
+# Assign identity of clusters
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.6"
+
+# Plot the UMAP
+
+#pdf("tumor_dimplot_integrated_seurat_clusters_snn_res0.6.#pdf", height=5)
+DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 4)
+#dev.off()
+
+
+
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(seurat_integrated, 
+                     vars = c("ident", "seq_folder")) %>%
+  dplyr::count(ident, seq_folder) %>%
+  tidyr::spread(ident, n)
+
+# View table
+View(n_cells)
+# View table
+
+write.table(as.data.frame(n_cells), "tumor_cells_cluster_per_organoid_snn_res.0.6.txt", quote=FALSE, col.names = TRUE, row.names = FALSE)
+
+#pdf("tumor_dimplot_integrated_seurat_clusters_snn_res0.6_split.#pdf", height=5)
+DimPlot(seurat_integrated, 
+        label = TRUE, 
+        split.by = "seq_folder")  + NoLegend()
+#dev.off()
+
+
+#pdf("tumor_dimplot_integrated_seurat_clusters_snn_res0.6_split_cellcycle.#pdf", height=5)
+DimPlot(seurat_integrated,
+        label = TRUE, 
+        split.by = "Phase")  + NoLegend()
+#dev.off()
+
+
+```
+
+
+### set res 0.6
+
+
+```{r results='hide', message=TRUE, warning=TRUE}
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.6"
+
+
+# Determine metrics to plot present in seurat_integrated@meta.data
+metrics <-  c("nUMI", "nGene", "S.Score", "G2M.Score", "mitoRatio")
+
+#pdf("tumor_FeaturePlot_integrated_seurat_clusters_snn_res0.6_QCmetrics.#pdf", height=5)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = metrics,
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE)
+#dev.off()
+
+# Save integrated seurat object
+saveRDS(seurat_integrated, "tumor_integrated_seurat_with_reductions.rds")
+
+# read the integrated data and make sure it looks okay
+seurat_integrated= readRDS("tumor_integrated_seurat_with_reductions.rds")
+
+DimPlot(seurat_integrated)
+
+# Defining the information in the seurat object of interest
+columns <- c(paste0("PC_", 1:16),
+             "ident",
+             "UMAP_1", "UMAP_2")
+
+# Extracting this data from the seurat object
+pc_data <- FetchData(seurat_integrated, 
+                     vars = columns)
+
+list(seurat_integrated@reductions)
+# Extract the UMAP coordinates for the first 10 cells
+seurat_integrated@reductions$umap@cell.embeddings[1:10, 1:2]
+
+# Adding cluster label to center of cluster on UMAP
+umap_label <- FetchData(seurat_integrated, 
+                        vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+
+# Plotting a UMAP plot for each of the PCs
+#pdf("tumor_FeaturePlot_integrated_seurat_clusters_snn_res0.6_PCs.#pdf")
+map(paste0("PC_", 1:16), function(pc){
+  ggplot(pc_data, 
+         aes(UMAP_1, UMAP_2)) +
+    geom_point(aes_string(color=pc), 
+               alpha = 0.7) +
+    scale_color_gradient(guide = FALSE, 
+                         low = "grey90", 
+                         high = "blue")  +
+    geom_text(data=umap_label, 
+              aes(label=ident, x, y)) +
+    ggtitle(pc)
+}) %>% 
+  plot_grid(plotlist = .)
+#dev.off()
+
+
+# Examine PCA results 
+print(seurat_integrated[["pca"]], dims = 1:5, nfeatures = 5)
+
+
+# Select the RNA counts slot to be the default assay
+DefaultAssay(seurat_integrated) <- "RNA"
+
+# Normalize RNA data for visualization purposes
+seurat_integrated <- NormalizeData(seurat_integrated, verbose = FALSE)
+
+
+##pdf("tumor_FeaturePlot_integrated_seurat_clusters_snn_res0.6_split_EPCAM_ITGA6.#pdf", height=6, width=6)
+png("FeaturePlot_integrated_seurat_clusters_snn_res0.6_split_EPCAM_ITGA6.png", height=600, width=1600)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = c("EPCAM", "ITGA6"),
+            split.by= "seq_folder",
+            ncol=2,
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE,
+            label.size=3)
+#dev.off()
+
+
+##pdf("tumor_FeaturePlot_integrated_seurat_clusters_snn_res0.6_EPCAM_ITGA6.#pdf", height=6, width=3)
+png("FeaturePlot_integrated_seurat_clusters_snn_res0.6_EPCAM_ITGA6.png", height=600, width=300)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = c("EPCAM", "ITGA6"),
+            #split.by= "sample",
+            ncol=1,
+            order = TRUE,
+            min.cutoff = 'q10', 
+            label = TRUE,
+            label.size=3)
+#dev.off()
+
+```
+
+
+### Final plots
+
+#### cells signatures are from the following publications:
+
+1. Mammary epithelial cell lineages: Lim et al., 2010 (PMID: 20346151) DOI: 10.1186/bcr2560 
+2. MYC signature: MYC signature from table S1 in Horiuchi et al. "MYC pathway activation in triple-negative breast cancer is synthetic lethal with CDK inhibition" originally from: Chandriani et al. https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0006693#s5
+3. GSEA gene sets for: REACTOME_SIGNALING_BY_NOTCH and HALLMARK_HYPOXIA 
+
+```{r results='hide', message=TRUE, warning=TRUE}
+
+dittoDimPlot(seurat_integrated, "ident", size = 0.5,legend.size=1.5,do.label = TRUE,labels.highlight=FALSE)
+
+dittoDimPlot(seurat_integrated, "Phase",size = 0.5,legend.size=1.5, do.label = TRUE,labels.highlight=FALSE)
+
+dittoDimPlot(seurat_integrated, "ident",
+             size = 0.5,legend.size=1.5, do.label = TRUE,labels.highlight=FALSE,
+             split.by = "seq_folder", split.nrow=1)
+
+
+### MaSC scores
+
+lim_lp_up_list= list(c("ACSL1","ALDH1A3","ANPEP","ASIC1","ATP6V1B1","ATP6V1C2","BBOX1","C10orf90","C1QTNF1","C3","CCDC88B","CD14","CKMT1A","CLDN1","CSN2","CSN3","CTSC","CXCR4","CYP24A1","DAPP1","ELF5","FOLR1","FOXI1","GALNT15","GGT5","GJB2","GNE","HAPLN3","HIVEP3","HSD17B12","IL15","IL4I1","ITPR2","KIT","LALBA","LBP","LPCAT1","MELTF","NCALD","NOXO1","PDZK1IP1","PIGR","PLB1","QPCT","RASAL1","RASGEF1C","RFTN2","RPS6KL1","S100A8","SECTM1","SLC13A2","SLC28A3","SLC34A2","SORBS2","TNFAIP2","TSPAN33","WFDC3","XDH"))
+lim_mat_lum_up_list= list(c("ABCA7","ABCC8","ACOT11","ALCAM","ALDH3B1","ALDH3B2","ANKMY2","AQP11","ARFGEF3","ATP6V0E2","BATF","BBOF1","BTRC","C1orf210","CACNB3","CACNG4","CASZ1","CCDC92","CITED1","DNAAF3","DNAJC12","DRC3","DUSP10","EDEM1","EEF1A2","EPS8L1","ERN1","ESR1","FAAH","FBXO36","FER1L4","FGF13","FGL1","FLVCR2","FOXA1","FYCO1","G6PD","GADD45G","GALE","GMPR","GPRC5C","HDAC11","HES6","HID1","HMGCS2","HOXB2","HSD11B2","IL13RA1","KBTBD4","KLHL5","LAMA5","LMNTD2","LNX2","MBOAT1","MEIS1","MEIS3","MINDY1","MLPH","MYB","NECTIN4","NSD3","PAK4","PGAP6","PGR","PHKA1","PLEKHG3","PON3","PRLR","PROM2","PSD4","PTPN6","PVALB","PXYLP1","RABL3","RASEF","REEP6","SCMH1","SGMS1","SLC16A5","SLC22A18","SLC40A1","SLC44A4","SLC7A2","SLC7A4","SORT1","SPDEF","SPINK1","SPRR1A","SULT2B1","TANGO2","TBX3","TGM2","TMCO3","TMPRSS6","TNFSF11","TOX3","TP53INP2","TRIM6","TSPAN1","TSPAN13","TUBG1","VOPP1","VPS33B","WNK4","WNT4","WNT5A","WNT7B","YIPF6","ZDHHC1","ZFHX2","ZSCAN18"))
+lim_stem_cell_up= list(c("ABI3BP","ACER2","ACTA2","ACTG2","ACVR2A","ADAMTS1","ADAMTS2","ADARB1","ADGRA2","ADGRL1","AEBP1","AGPAT4","AHI1","AKT3","ALDH1L2","AMOTL1","ANGPTL2","ANKRD1","ANTXR1","AOPEP","APOE","AQP9","ARC","ARHGAP20","ARHGAP24","ARHGAP25","ARHGEF25","ARHGEF28","ARMH4","ARNTL","ARSI","ASPHD2","ATP2A2","AXL","BACH1","BAG3","BCAR1","BCL2L11","BCOR","BMP1","BMP7","BNC1","BTBD11","BVES","C19orf12","C1QTNF12","C1QTNF4","CACNB4","CADM1","CALD1","CALML3","CALU","CARD10","CAV1","CAVIN2","CBLB","CCDC3","CCDC85B","CCN2","CCND2","CD36","CD70","CDC42EP2","CDH13","CDH3","CDH4","CDKN1A","CHST3","CHST7","CLIP3","CLMP","CNN1","CNP","CNRIP1","COL12A1","COL14A1","COL16A1","COL17A1","COL18A1","COL23A1","COL4A1","COL4A2","COL5A1","COL5A2","COL7A1","COL9A2","CPNE8","CPXM1","CRISPLD1","CRLF1","CRYAB","CSDC2","CSPG4","CSRP2","CTNNAL1","CXCL14","CYGB","DCBLD2","DCHS1","DCUN1D3","DIPK2A","DKK3","DLK2","DLL1","DMWD","DOCK10","DPYSL3","DST","DUSP6","DUSP7","DZIP1L","EBF3","ECRG4","EDARADD","EDNRB","EEPD1","EFCAB1","EFNB1","EGFR","EGR2","EGR3","EID3","ELK3","ELOVL4","ELP5","ENC1","ENPP2","EOGT","EPAS1","EPDR1","EPHB1","ERF","ETS1","EVA1A","EVC","EXT1","FABP5","FAM184A","FAM216A","FAS","FBLN7","FBXO30","FERMT2","FEZ1","FGFRL1","FGL2","FHL1","FHOD3","FJX1","FLNC","FLRT2","FMOD","FOXP1","FST","FXYD1","FZD8","GEM","GJA1","GJC1","GNAI1","GNB4","GNG11","GOLIM4","GPC3","GPR176","GPR3","GPR87","GPSM1","GSN","GYPC","HACD1","HAS2","HDAC4","HEG1","HGFAC","HRAS","HS3ST3A1","HSPB2","HSPG2","HTRA1","ICAM1","ID4","IGFBP2","IGFBP3","IGFBP4","IGFBP6","IL17B","IL17RD","IL1B","IL24","IL6","IL6ST","INKA1","IRAG1","IRX4","ISM1","ITGA1","ITGA6","ITGA9","ITGB1","ITGB4","ITM2A","JAG1","JAM2","JAM3","KANK4","KCNIP3","KCNMA1","KCNMB1","KLHL21","KLHL29","KLHL42","KRT14","KRT16","KRT5","KRT75","L3HYPDH","LAG3","LAMA1","LAMA3","LAMB1","LAMB3","LAMC1","LARGE2","LBH","LCA5","LCAT","LEP","LGALS1","LGALS7","LGR6","LHFPL6","LIFR","LIMA1","LIMS2","LMOD1","LRCH2","LRP1","LRP4","LRRC8C","LRRN1","LTBP4","LUZP1","MALT1","MAMDC2","MAOB","MAP3K7CL","MATN2","MBNL1","MCAM","MEDAG","MEF2C","MEG3","MEST","MFNG","MGARP","MIA","MICAL2","MICOS10-NBL1","MME","MMP2","MPDZ","MRGPRF","MSRB3","MSX1","MTSS1","MXRA7","MYC","MYH11","MYL9","MYLK","MYOCD","NDN","NECTIN3","NETO2","NGF","NGFR","NLGN2","NNAT","NNMT","NPTX2","NRCAM","NRG1","NRP1","NRP2","NSG1","NT5E","NTF3","NTRK2","NUDT11","NXN","OSBPL6","OSR1","OXTR","P3H1","P3H2","PALM2AKAP2","PAMR1","PARD6G","PCBP4","PCDH18","PCDH19","PCDH7","PCDHGC3","PCOLCE","PDGFA","PDLIM4","PDLIM7","PDPN","PEG3","PGF","PHLDA3","PHLDB1","PKD1","PKNOX2","PKP1","PLA2G7","PLCH2","PLEKHA4","PLPP1","PLPP3","PLS3","PLXNA2","PODN","POGLUT2","POPDC2","POSTN","POU3F1","PPP1R14A","PPP1R16B","PPP1R18","PPP1R3C","PPP2R2B","PRDM1","PRICKLE1","PRICKLE2","PRNP","PROS1","PRRX1","PRX","PSD2","PTGS2","PTPRE","PTPRT","PXDC1","PXN","QKI","QRICH2","RAB34","RAPGEF1","RARB","RARRES2","RASIP1","RASL12","RBPMS","RCN3","RCSD1","RECK","RELN","RFLNB","RFX2","RHOJ","RND3","RNF165","RUSC2","SBSPON","SCARF2","SCHIP1","SCML2","SCN4B","SDK2","SEC24D","SEMA3C","SEMA5A","SERPINF1","SERPING1","SERPINH1","SGCB","SGIP1","SH2D5","SH3TC1","SHE","SIAH2","SIMC1","SKI","SLC12A4","SLC1A3","SLC1A5","SLC25A4","SLC27A3","SLC27A6","SLC2A3","SLC38A5","SLC4A3","SLC6A8","SLCO3A1","SLIT2","SLIT3","SMIM13","SMTN","SNAI2","SNCA","SNTB2","SOBP","SOGA1","SORBS1","SORCS1","SOX11","SPHK1","SPRED1","SRGN","SRPX","SSBP2","SSH1","STAC","STAC2","STARD8","STXBP4","SULF1","SVEP1","SYDE1","SYNM","TACC1","TAGLN","TAMALIN","TBX2","TCF4","TCF7L1","TCOF1","TENM3","TES","TGFB1I1","TGFBR3","THBS1","THSD1","THY1","TIE1","TIMP3","TINAGL1","TM7SF3","TMEM121","TMEM178A","TMEM201","TMEM204","TMEM255B","TMEM47","TMEM64","TNS1","TNS4","TOX","TP63","TPM2","TPST1","TRIM29","TRIM9","TRO","TRPC1","TSHZ2","TSHZ3","TSKU","TSPY26P","TSPYL2","TTYH2","TUBB6","TWIST2","UCN2","UNC45A","UPP1","VCAN","VGLL3","VIM","VIT","VSIR","VSNL1","WIF1","WIPF1","WTIP","YAF2","ZC3H12B","ZNF219","ZNF423"))
+
+seurat_integrated= AddModuleScore(seurat_integrated, features=lim_lp_up_list, name="LP_score")
+seurat_integrated= AddModuleScore(seurat_integrated, features=lim_mat_lum_up_list, name="Mature_Lum_score")
+seurat_integrated= AddModuleScore(seurat_integrated, features=lim_stem_cell_up, name="Stem_cell_score")
+
+View(seurat_integrated@meta.data)
+
+names(seurat_integrated@meta.data)
+# Determine metrics to plot present in seurat_integrated@meta.data
+metrics2 <-  c("LP_score1", "Mature_Lum_score1", "Stem_cell_score1")
+Idents(seurat_integrated)= "integrated_snn_res.0.6"
+
+#pdf("FeaturePlot_integrated_tumor_seurat_clusters_snn_res0.6_LP_scores_q5_split.#pdf", height=6, width=2.75)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = metrics2,
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q5',
+            label = TRUE, label.size=2.5, split.by = "sample")
+#dev.off()
+
+#pdf("FeaturePlot_integrated_tumor_seurat_clusters_snn_res0.6_LP_scores_q5_split_sample.#pdf", height=7, width=13.3)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = metrics2,
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q5',
+            label = TRUE, split.by = "seq_folder")
+#dev.off()
+
+
+## HALLMARK_HYPOXIA
+
+hypoxia= list(c("ACKR3","ADM","ADORA2B","AK4","AKAP12","ALDOA","ALDOB","ALDOC","AMPD3","ANGPTL4","ANKZF1","ANXA2","ATF3","ATP7A","B3GALT6","B4GALNT2","BCAN","BCL2","BGN","BHLHE40","BNIP3L","BRS3","BTG1","CA12","CASP6","CAV1","CAVIN1","CAVIN3","CCN1","CCN2","CCN5","CCNG2","CDKN1A","CDKN1B","CDKN1C","CHST2","CHST3","CITED2","COL5A1","CP","CSRP2","CXCR4","DCN","DDIT3","DDIT4","DPYSL4","DTNA","DUSP1","EDN2","EFNA1","EFNA3","EGFR","ENO1","ENO2","ENO3","ERO1A","ERRFI1","ETS1","EXT1","F3","FAM162A","FBP1","FOS","FOSL2","FOXO3","GAA","GALK1","GAPDH","GAPDHS","GBE1","GCK","GCNT2","GLRX","GPC1","GPC3","GPC4","GPI","GRHPR","GYS1","HAS1","HDLBP","HEXA","HK1","HK2","HMOX1","HOXB9","HS3ST1","HSPA5","IDS","IER3","IGFBP1","IGFBP3","IL6","ILVBL","INHA","IRS2","ISG20","JMJD6","JUN","KDELR3","KDM3A","KIF5A","KLF6","KLF7","KLHL24","LALBA","LARGE1","LDHA","LDHC","LOX","LXN","MAFF","MAP3K1","MIF","MT1E","MT2A","MXI1","MYH9","NAGK","NCAN","NDRG1","NDST1","NDST2","NEDD4L","NFIL3","NOCT","NR3C1","P4HA1","P4HA2","PAM","PCK1","PDGFB","PDK1","PDK3","PFKFB3","PFKL","PFKP","PGAM2","PGF","PGK1","PGM1","PGM2","PHKG1","PIM1","PKLR","PKP1","PLAC8","PLAUR","PLIN2","PNRC1","PPARGC1A","PPFIA4","PPP1R15A","PPP1R3C","PRDX5","PRKCA","PYGM","RBPJ","RORA","RRAGD","S100A4","SAP30","SCARB1","SDC2","SDC3","SDC4","SELENBP1","SERPINE1","SIAH2","SLC25A1","SLC2A1","SLC2A3","SLC2A5","SLC37A4","SLC6A6","SRPX","STBD1","STC1","STC2","SULT2B1","TES","TGFB3","TGFBI","TGM2","TIPARP","TKTL1","TMEM45A","TNFAIP3","TPBG","TPD52","TPI1","TPST2","UGP2","VEGFA","VHL","VLDLR","WSB1","XPNPEP1","ZFP36","ZNF292"))
+
+seurat_integrated= AddModuleScore(seurat_integrated, features=hypoxia, name="hypoxia")
+
+head(seurat_integrated@meta.data)
+
+#pdf("FeaturePlot_integrated_tumor_seurat_clusters_snn_res0.6_hypoxia_scores_q10_split_sample.#pdf", height=3, width = 20)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = "hypoxia1",
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE, label.size=2.5, split.by = "seq_folder")
+#dev.off()
+
+
+### MYC signature
+
+myc_signature= list(c("SSBP1","IL13RA1","LOX","XPOT","EPAS1","SRPK1","RPIA","HNRPD","FLJ10534","NIPSNAP3A","ANP32A","COX7A1","NSUN2","TOP2A","WDR12","SLC25A5","TIM14","SLC22A17","URB","BLMH","ADM","PP","EGR1","ALPK2","MRPS27","RUVBL1","DAB2","HSPC132","GLS","TPST1","U2AF1","APBB1IP","FLJ10458","PRC1","CD164L1","TYSND1","LRP10","CCL2","THOC4","HSPE1","KIAA0523","MGC13096","OXTR","MYL9","HSPC111","PPP1R3C","DEFA6","HOMER1","TBC1D14","PABPC1","NOL5A","MAP6","PLAC8","TFPI2","TPM1","TNFRSF11B","G0S2","R3HDM","MGC40397","||","EI24","VDAC3","TCP1","RPL10A","KIAA1363","RPS4Y1","F3","NEU1","MIG-6","C20orf155","PRKRIR","SNRPE","PDCD2","MLF1IP","MRPL45","HSPB2","MYL6","TPD52L1","TCOF1","HYAL3","FLJ14494","HSPA9B","NID67","MRPL32","RPL23A","BZW2","RIT1","STIP1","LSM2","IGFBP4","FBL","SLC5A6","||","ANGPTL2","GRPEL2","RTN4","ZRF1","PLK2","RPL29","MRPS26","FLJ12525","ELL2","C14orf104","HIST1H4I","SCC-112","C1QBP","TBC1D2","||","FEZ1","IL6ST","FABP5","NOLC1","MAP4K1","SGCB","FLJ38507","ARHE","C10orf119","MGC9850","DDIT4L","FLJ21125","GART","RNF138","OLFML2B","SNRPF","RGS16","SLC39A14","CSTF3","SLC16A1","GPSM1","EBNA1BP2","HNRPF","MCM2","CAPG","WIPI49","TEX10","DKFZP564B167","FBN1","ERBP","NOLA1","KRT19","UBA2","COX7C","8D6A","MGC14560","MGC4399","FLJ14668","SP100","ESRRA","LBH","TRIT1","ATP5F1","PTMA","NOL1","DSCR2","PSG4","WBSCR1","TNC","D15Wsu75e","KRTAP1-5","SULF1","MYC","SERPING1","AK5","ITGB1","DDX1","GREM1","H2AFZ","CRIM1","BASP1","LDHB","EDG2","NPM1","CABC1","CENPH","PSAT1","NOP5/NOP58","TBRG4","C14orf147","RAN","DPP4","MYADM","GK2","DIA1","PAI-RBP1","CSRP1","LOC91942","G1P2","ANKRD27","MRPL50","C15orf15","IGFBP3","FLJ20516","NUCB2","BNIP3L","WNT5B","SH3BGRL3","||","HES1","TUBB2","GALNTL4","DCBLD2","CD59","CNOT8","DKFZp761B128","CKAP4","SORD","LOC90355","DHODH","E2F5","CALML4","TOMM22","C6orf192","MAGEF1","PFDN2","MRPS23","SF1","LHFP","KLF12","SNRPG","UBE2N","RPS24","RPL7A","GAL","CHC1","MGC4308","IGFBP6","OPTN","TIMM13","RAB3B","MRPS22","THOC3","MMP11","ASPM","PPT1","CL640","PAICS","POLR2H","CAP2","MRPS9","ADORA2B","XTP3TPA","NUP35","IFRD2","CYC1","COPZ2","ITGA2","BDNF","CYBA","PTD004","PAIP2","SSB","RGS2","C14orf156","KIAA0669","PARP1","MTHFD2","CLIPR-59","RHBDF1","UCK2","BOP1","HSPA14","EXOSC3","EXT1","P4HA2","MMP3","PRSS23","VEGFC","GPD1L","PRPS1","AHCY","FSTL1","PRKCDBP","SLCO4A1","SCARB1","POLR3G","KIAA1737","KCTD12","RFC5","H2AFX","MGC2574","MCM6","AGPAT5","CGI-12","EBPL","HIRA","NFIL3","TRIB2","SQRDL","NOB1P","KRTHA4","MGC2714","CHCHD4","ASB5","MYCBP","WDR18","CXCL1","C12orf14","HLA-G","DUSP1","CSE1L","MGC15668","ODC1","PLEKHM1","KIAA0992","GDF15","SMAD1","CLNS1A","MGC31967","CXCL12","TTK","LARS","CDH11","CNN1","CSIG","CBX3","PHF10","CCT8","PSG11","SEH1L","UTP14A","DKK3","DUSP2","ITGA6","EDG1","DKK1","ALDH1A1","STRAP","REPIN1","BCCIP","NTN4","ARRB1","NCL","RPS3","FLJ20641","COL11A1","SF3B3","KLHL8","PPM1G","MRPL42","LSM5","CALD1","RBM8A","SARS2","CCT5","PDGFRA","ESM1","ADAM19","SLC16A2","HES6","RPL5","CREB3","MATN2"))
+update_genes= UpdateSymbolList(symbols = c("SSBP1","IL13RA1","LOX","XPOT","EPAS1","SRPK1","RPIA","HNRPD","FLJ10534","NIPSNAP3A","ANP32A","COX7A1","NSUN2","TOP2A","WDR12","SLC25A5","TIM14","SLC22A17","URB","BLMH","ADM","PP","EGR1","ALPK2","MRPS27","RUVBL1","DAB2","HSPC132","GLS","TPST1","U2AF1","APBB1IP","FLJ10458","PRC1","CD164L1","TYSND1","LRP10","CCL2","THOC4","HSPE1","KIAA0523","MGC13096","OXTR","MYL9","HSPC111","PPP1R3C","DEFA6","HOMER1","TBC1D14","PABPC1","NOL5A","MAP6","PLAC8","TFPI2","TPM1","TNFRSF11B","G0S2","R3HDM","MGC40397","||","EI24","VDAC3","TCP1","RPL10A","KIAA1363","RPS4Y1","F3","NEU1","MIG-6","C20orf155","PRKRIR","SNRPE","PDCD2","MLF1IP","MRPL45","HSPB2","MYL6","TPD52L1","TCOF1","HYAL3","FLJ14494","HSPA9B","NID67","MRPL32","RPL23A","BZW2","RIT1","STIP1","LSM2","IGFBP4","FBL","SLC5A6","||","ANGPTL2","GRPEL2","RTN4","ZRF1","PLK2","RPL29","MRPS26","FLJ12525","ELL2","C14orf104","HIST1H4I","SCC-112","C1QBP","TBC1D2","||","FEZ1","IL6ST","FABP5","NOLC1","MAP4K1","SGCB","FLJ38507","ARHE","C10orf119","MGC9850","DDIT4L","FLJ21125","GART","RNF138","OLFML2B","SNRPF","RGS16","SLC39A14","CSTF3","SLC16A1","GPSM1","EBNA1BP2","HNRPF","MCM2","CAPG","WIPI49","TEX10","DKFZP564B167","FBN1","ERBP","NOLA1","KRT19","UBA2","COX7C","8D6A","MGC14560","MGC4399","FLJ14668","SP100","ESRRA","LBH","TRIT1","ATP5F1","PTMA","NOL1","DSCR2","PSG4","WBSCR1","TNC","D15Wsu75e","KRTAP1-5","SULF1","MYC","SERPING1","AK5","ITGB1","DDX1","GREM1","H2AFZ","CRIM1","BASP1","LDHB","EDG2","NPM1","CABC1","CENPH","PSAT1","NOP5/NOP58","TBRG4","C14orf147","RAN","DPP4","MYADM","GK2","DIA1","PAI-RBP1","CSRP1","LOC91942","G1P2","ANKRD27","MRPL50","C15orf15","IGFBP3","FLJ20516","NUCB2","BNIP3L","WNT5B","SH3BGRL3","||","HES1","TUBB2","GALNTL4","DCBLD2","CD59","CNOT8","DKFZp761B128","CKAP4","SORD","LOC90355","DHODH","E2F5","CALML4","TOMM22","C6orf192","MAGEF1","PFDN2","MRPS23","SF1","LHFP","KLF12","SNRPG","UBE2N","RPS24","RPL7A","GAL","CHC1","MGC4308","IGFBP6","OPTN","TIMM13","RAB3B","MRPS22","THOC3","MMP11","ASPM","PPT1","CL640","PAICS","POLR2H","CAP2","MRPS9","ADORA2B","XTP3TPA","NUP35","IFRD2","CYC1","COPZ2","ITGA2","BDNF","CYBA","PTD004","PAIP2","SSB","RGS2","C14orf156","KIAA0669","PARP1","MTHFD2","CLIPR-59","RHBDF1","UCK2","BOP1","HSPA14","EXOSC3","EXT1","P4HA2","MMP3","PRSS23","VEGFC","GPD1L","PRPS1","AHCY","FSTL1","PRKCDBP","SLCO4A1","SCARB1","POLR3G","KIAA1737","KCTD12","RFC5","H2AFX","MGC2574","MCM6","AGPAT5","CGI-12","EBPL","HIRA","NFIL3","TRIB2","SQRDL","NOB1P","KRTHA4","MGC2714","CHCHD4","ASB5","MYCBP","WDR18","CXCL1","C12orf14","HLA-G","DUSP1","CSE1L","MGC15668","ODC1","PLEKHM1","KIAA0992","GDF15","SMAD1","CLNS1A","MGC31967","CXCL12","TTK","LARS","CDH11","CNN1","CSIG","CBX3","PHF10","CCT8","PSG11","SEH1L","UTP14A","DKK3","DUSP2","ITGA6","EDG1","DKK1","ALDH1A1","STRAP","REPIN1","BCCIP","NTN4","ARRB1","NCL","RPS3","FLJ20641","COL11A1","SF3B3","KLHL8","PPM1G","MRPL42","LSM5","CALD1","RBM8A","SARS2","CCT5","PDGFRA","ESM1","ADAM19","SLC16A2","HES6","RPL5","CREB3","MATN2"))
+myc_signature_updated= list(c(update_genes))
+
+
+seurat_integrated= AddModuleScore(seurat_integrated, features=myc_signature_updated, name="myc_signature")
+
+names(seurat_integrated@meta.data)
+
+#pdf("FeaturePlot_integrated_tumor_seurat_clusters_snn_res0.6_myc_signature_Chandrani_scores_q10_split_sample.#pdf", height=3, width=20)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = "myc_signature1",
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE, label.size=2.5, split.by = "seq_folder")
+#dev.off()
+
+
+metadata= seurat_integrated@meta.data
+names(metadata)
+
+
+#pdf("myc_hypoxia_bright.#pdf", width=5, height=2)
+FeaturePlot(seurat_integrated, 
+            features = c("myc_signature1", "hypoxia1"), order = T, 
+            min.cutoff = "q50",max.cutoff = "q99", blend = T, 
+            cols = c("blue", "green", "magenta"), blend.threshold = 0) &DarkTheme() &NoAxes() 
+#dev.off()
+
+
+#pdf("stemcell_hypoxia_bright.#pdf", width=5, height=2)
+FeaturePlot(seurat_integrated, 
+            features = c("Stem_cell_score1","hypoxia1"), order = T, 
+            min.cutoff = "q50",max.cutoff = "q99", blend = T, 
+            cols = c("blue", "green", "magenta"), blend.threshold = 0) &DarkTheme() &NoAxes() 
+#dev.off()
+
+### NOTCH1: REACTOME_SIGNALING_BY_NOTCH
+
+notch_reactome= c("ACTA2","ADAM10","ADAM17","AGO1","AGO2","AGO3","AGO4","AKT1","APH1A","APH1B","ARRB1","ARRB2","ATP2A1","ATP2A2","ATP2A3","B4GALT1","CCNC","CCND1","CDK8","CNTN1","CREB1","CREBBP","CUL1","DLGAP5","DLK1","DLL1","DLL4","DNER","DTX1","DTX2","DTX4","E2F1","E2F3","EGF","EGFR","ELF3","EP300","FABP7","FBXW7","FCER2","FLT4","FURIN","GZMB","H2AB1","H2AC14","H2AC18","H2AC19","H2AC20","H2AC4","H2AC6","H2AC7","H2AC8","H2AJ","H2AX","H2AZ1","H2AZ2","H2BC1","H2BC10","H2BC11","H2BC12","H2BC13","H2BC14","H2BC15","H2BC17","H2BC21","H2BC3","H2BC4","H2BC5","H2BC6","H2BC7","H2BC8","H2BC9","H2BS1","H2BU1","H3-3A","H3-3B","H3C1","H3C10","H3C11","H3C12","H3C13","H3C14","H3C15","H3C2","H3C3","H3C4","H3C6","H3C7","H3C8","H4-16","H4C1","H4C11","H4C12","H4C13","H4C14","H4C15","H4C2","H4C3","H4C4","H4C5","H4C6","H4C8","H4C9","HDAC1","HDAC10","HDAC11","HDAC2","HDAC3","HDAC4","HDAC5","HDAC6","HDAC7","HDAC8","HDAC9","HES1","HES5","HEY1","HEY2","HEYL","HIF1A","IKZF1","ITCH","JAG1","JAG2","JUN","KAT2A","KAT2B","LFNG","MAML1","MAML2","MAML3","MAMLD1","MDK","MFNG","MIB1","MIB2","MIR150","MIR181C","MIR200B","MIR200C","MIR206","MIR302A","MIR34B","MIR34C","MIR449A","MIR449B","MIR449C","MOV10","MYC","NBEA","NCOR1","NCOR2","NCSTN","NEURL1","NEURL1B","NOTCH1","NOTCH2","NOTCH3","NOTCH4","NUMB","PBX1","PLXND1","POFUT1","POGLUT1","PRKCI","PSEN1","PSEN2","PSENEN","PSMA1","PSMA2","PSMA3","PSMA4","PSMA5","PSMA6","PSMA7","PSMB1","PSMB10","PSMB2","PSMB3","PSMB4","PSMB5","PSMB6","PSMB7","PSMB8","PSMB9","PSMC1","PSMC2","PSMC3","PSMC4","PSMC5","PSMC6","PSMD1","PSMD10","PSMD11","PSMD12","PSMD13","PSMD14","PSMD2","PSMD3","PSMD4","PSMD5","PSMD6","PSMD7","PSMD8","PSMD9","PSME1","PSME2","PSME3","PSMF1","PTCRA","RAB6A","RBPJ","RBX1","RFNG","RPS27A","RUNX1","SEL1L","SEM1","SIRT6","SKP1","SMAD3","SNW1","ST3GAL3","ST3GAL4","ST3GAL6","STAT1","TACC3","TBL1X","TBL1XR1","TFDP1","TFDP2","TLE1","TLE2","TLE3","TLE4","TMED2","TNRC6A","TNRC6B","TNRC6C","TP53","UBA52","UBB","UBC","WWC1","WWP2","YBX1","YWHAZ")
+
+notch_reactome= UpdateSymbolList(symbols = notch_reactome)
+notch_reactome= list(c(notch_reactome))
+
+
+seurat_integrated= AddModuleScore(seurat_integrated, features=notch_reactome, name="notch_reactome")
+
+head(seurat_integrated@meta.data)
+
+#pdf("FeaturePlot_integrated_tumor_seurat_clusters_snn_res0.6_notch_reactome_scores_q50_split.#pdf", height=3, width=20)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = "notch_reactome1",
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q50',
+            label = TRUE, label.size=2.5, split.by = "seq_folder")
+#dev.off()
+
+
+#pdf("FeaturePlot_integrated_tumor_seurat_clusters_snn_res0.6_notch_hif_myc_sc_reactome_scores_q50_split.#pdf", height=12, width=20)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = c("notch_reactome1","myc_signature1","hypoxia1","Stem_cell_score1"),
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q50',
+            label = TRUE, label.size=2.5, split.by = "seq_folder")
+#dev.off()
+
+#pdf("FeaturePlot_integrated_tumor_seurat_clusters_snn_res0.6_notch_hif_myc_sc_reactome_scores_q50.#pdf", height=12, width=4)
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = c("notch_reactome1","myc_signature1","hypoxia1","Stem_cell_score1"),
+            ncol=1,
+            pt.size = 0.4, 
+            order = TRUE,
+            min.cutoff = 'q50',
+            label = TRUE, label.size=2.5)
+#dev.off()
+
+
+
+## find markers as per seurat and plot cluster specific marker genes
+
+selected_marker_genes= c("SAT1","CCN2","VEGFA","MGP","NFKBIA","KRT17","RPL7A")
+
+
+#pdf("selected_Markers_tumor_samples_q10_final_full_ids.#pdf", width=20, height=18)
+FeaturePlot(seurat_integrated, 
+            features = selected_marker_genes, 
+            cols = c("grey", "blue"), reduction = "umap", split.by = "seq_folder",
+            min.cutoff = 'q10',ncol=1) 
+#& 
+ # scale_colour_gradientn(colours = rev(brewer.pal(n = 11, name = "RdBu")))
+# also a decent contrast of grey with #B2182B
+#dev.off()
+
+
+```
+
+Session info
+
+```{r session info, message=FALSE, warning=FALSE}
+sessionInfo()
+
+```
+
